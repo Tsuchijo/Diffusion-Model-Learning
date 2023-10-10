@@ -63,7 +63,7 @@ def train(config):
     # is cumprod of 1-beta from 0 to T
     # T is total number of timesteps
     t_total = 1000
-    betas = np.linspace(1e-4, 1.0, t_total)
+    betas = np.linspace(1e-4, 0.1, t_total)
     alphas = torch.cumprod(1 - torch.tensor(betas), 0)
 
     ## Load the model ##
@@ -74,6 +74,9 @@ def train(config):
 
     ## Load the optimizer ##
     optimizer = torch.optim.Adam(model.parameters(), lr=config.optim.lr)
+
+    plt.scatter(train_set.data[:, 0], train_set.data[:, 1])
+    plt.show()
 
     ## Training loop ##
     for iteration in range(config.training.n_iters):
@@ -92,6 +95,16 @@ def train(config):
         optimizer.zero_grad()
         print(loss.item())
         #wandb.log({"loss": loss.item()})
+    
+    ## Plot the results ##
+    # run inference pass on test set
+    x0 = next(iter(val_loader))
+    x_val = inference_pass(x0, t_total, alphas, betas, model)
+    # detach and make numpy
+    x_val = x_val.detach().numpy()
+    plt.scatter(x_val[:, 0], x_val[:, 1])
+    plt.show()
+
         
 
 ## Forward pass of the diffusion model using normal distribution of noise
@@ -105,13 +118,27 @@ def forward_pass( x0, timesteps, alpha):
     x_t = torch.sqrt(1 - a_t) * x0 + torch.sqrt(a_t) * epsilon
     return x_t, epsilon
 
+## Inference pass of the diffusion model
+# for a set number of timesteps, take in noise and then repeatedly apply the reverse diffusion process
+# to get the original distribution
+def inference_pass(x0, timesteps, alpha, beta, model):
+    epsilon = torch.randn_like(x0)
+    # reverse diffusion process in noise and then apply model repeatedly
+    for i in reversed(range(timesteps)):
+        a_t = alpha[i]
+        timestep_tensor = torch.ones((x0.shape[0], 1)) * i
+        x_t = torch.cat([epsilon, timestep_tensor], axis=1)
+        x_t = model(x_t)
+        epsilon = 1 / np.sqrt(1 - beta[i]) * (epsilon - (beta[i] / np.sqrt(1 - a_t)) * x_t)
+    return epsilon
+
 
 
 def main(argv):
     #logging.init(config=FLAGS.config.to_dict(), tags=FLAGS.tags, name=FLAGS.wandb_name)
     train(FLAGS.config)
     #wandb.log({})
-    
+
 
 
 if __name__ == "__main__":

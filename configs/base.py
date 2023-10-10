@@ -5,7 +5,7 @@ import torch
 def add_training_configs(config):
     config.training = training = ConfigDict()
     training.batch_size = 2048
-    training.n_iters = 100000
+    training.n_iters = 100
     training.save_interval = config_dict.placeholder(int) # If given, will save a save of the model every save_interval iterations
     training.log_interval = 1000
     training.eval_interval = 1000
