@@ -13,6 +13,7 @@ import numpy as np
 import diffusion_models
 from diffusion_models import data
 import wandb
+import gc
 
 logging.support_unobserve()
 
@@ -31,11 +32,13 @@ class MLP_diffusion(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(3, 256),
+            torch.nn.Linear(3, 512),
             torch.nn.ReLU(),
-            torch.nn.Linear(256, 256),
+            torch.nn.Linear(512, 512),
             torch.nn.ReLU(),
-            torch.nn.Linear(256, 2),
+            torch.nn.Linear(512, 512),
+            torch.nn.ReLU(),
+            torch.nn.Linear(512, 2),
         )
         self.double()
     
@@ -63,45 +66,52 @@ def train(config):
     # is cumprod of 1-beta from 0 to T
     # T is total number of timesteps
     t_total = 1000
-    betas = np.linspace(1e-4, 0.1, t_total)
+    betas = np.linspace(1e-4, 0.3, t_total)
     alphas = torch.cumprod(1 - torch.tensor(betas), 0)
+    alpha_t = 1- torch.tensor(betas)
 
     ## Load the model ##
-    model = MLP_diffusion()
+    model = MLP_diffusion().to('cuda')
+
     # randomize weights
     for p in model.parameters():
         torch.nn.init.normal_(p, 0, 0.05)
 
     ## Load the optimizer ##
     optimizer = torch.optim.Adam(model.parameters(), lr=config.optim.lr)
-
     plt.scatter(train_set.data[:, 0], train_set.data[:, 1])
+    plt.show()
+    x_t, _ = forward_pass(torch.from_numpy(train_set.data), t_total-1, alphas)
+    plt.scatter(x_t[:, 0], x_t[:, 1])
     plt.show()
 
     ## Training loop ##
     for iteration in range(config.training.n_iters):
-        x0 = next(inf_train_loader)
+        x0 = next(inf_train_loader).to('cuda')
         # forward pass
         # define timestep by random sampling from 1 - t_total
-        timestep = torch.randint(1, t_total, (x0.shape[0], 1))
-        x_t, epsilon = forward_pass(x0, timestep, alphas)
+        timestep = torch.randint(0, t_total-1, (x0.shape[0], 1)).to('cuda')
+        x_t, epsilon = forward_pass(x0.to('cpu'), timestep.to('cpu'), alphas)
         # backward pass
         # append timestep to x_t
-        x_t = torch.cat([x_t, timestep], axis=1)
-        eps_pred = model(x_t)
-        loss = torch.nn.functional.mse_loss(eps_pred, epsilon)
-        loss.backward()
-        optimizer.step()
+        x_t = torch.cat([x_t.to('cuda'), timestep.to('cuda')], axis=1)
         optimizer.zero_grad()
-        print(loss.item())
+        eps_pred = model(x_t)
+        loss = torch.nn.functional.mse_loss(eps_pred, epsilon.to('cuda'), reduction='none')
+        mean_loss = torch.mean(loss)
+        mean_loss.backward()
+        optimizer.step()
+        #optimizer.zero_grad()
+        print(mean_loss.item())
         #wandb.log({"loss": loss.item()})
     
     ## Plot the results ##
     # run inference pass on test set
+    model.eval().to('cuda')
     x0 = next(iter(val_loader))
-    x_val = inference_pass(x0, t_total, alphas, betas, model)
+    x_val = inference_pass(x0, t_total, alpha_t, alphas, model)
     # detach and make numpy
-    x_val = x_val.detach().numpy()
+    x_val = x_val.to('cpu').detach().numpy()
     plt.scatter(x_val[:, 0], x_val[:, 1])
     plt.show()
 
@@ -113,24 +123,30 @@ def forward_pass( x0, timesteps, alpha):
     # x0 is the input image, uses precalculated alpha_t from timeskipping
     # alpha_bar is the cumulative product of beta_t - 1 from 0 to t where t is the current timestep
     # calculate noise from normal distribution (epsilon)
-    epsilon = torch.randn_like(x0)
+    epsilon = torch.normal(torch.zeros_like(x0), torch.ones_like(x0))
     a_t = alpha[timesteps]
-    x_t = torch.sqrt(1 - a_t) * x0 + torch.sqrt(a_t) * epsilon
+    x_t = torch.sqrt(a_t) * x0 + torch.sqrt(1 - a_t) * epsilon
     return x_t, epsilon
 
 ## Inference pass of the diffusion model
 # for a set number of timesteps, take in noise and then repeatedly apply the reverse diffusion process
 # to get the original distribution
-def inference_pass(x0, timesteps, alpha, beta, model):
-    epsilon = torch.randn_like(x0)
+def inference_pass(x0, timesteps, alpha, alpha_bar, model):
+    x_T = torch.normal(torch.zeros_like(x0), torch.ones_like(x0)).to('cuda')
     # reverse diffusion process in noise and then apply model repeatedly
     for i in reversed(range(timesteps)):
         a_t = alpha[i]
+        a_bar_t = alpha_bar[i]
         timestep_tensor = torch.ones((x0.shape[0], 1)) * i
-        x_t = torch.cat([epsilon, timestep_tensor], axis=1)
-        x_t = model(x_t)
-        epsilon = 1 / np.sqrt(1 - beta[i]) * (epsilon - (beta[i] / np.sqrt(1 - a_t)) * x_t)
-    return epsilon
+        eps = model(torch.cat([x_T, timestep_tensor.to('cuda')], axis=1).to('cuda')).to('cuda')
+        z_t = torch.normal(torch.zeros_like(x0), torch.ones_like(x0)).to('cuda')
+        if i == 0:
+            x_T = 1/np.sqrt(a_t) * (x_T - (((1 - a_t) / np.sqrt(1 - a_bar_t)) * eps))
+        else:
+            x_T = 1/np.sqrt(a_t) * (x_T - (((1 - a_t) / np.sqrt(1 - a_bar_t)) * eps)) + np.sqrt(1 - a_t) * z_t
+        print(torch.max(x_T))
+       
+    return x_T
 
 
 
