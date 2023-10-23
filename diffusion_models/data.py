@@ -3,7 +3,8 @@ import torch
 #from synthetic_datasets import toy_2d
 from torch.utils.data import Dataset
 from common_utils.random import RNG
-
+import sklearn
+import sklearn.datasets
 
 ## Manually add dataset to get over arg error
 class ToyDatasetBase(Dataset):
@@ -27,6 +28,12 @@ class Checkerboard(ToyDatasetBase):
         data = np.concatenate([x1[:, None], x2[:, None]], 1) / 2
         self.data = data
 
+class SwissRoll(ToyDatasetBase):
+    def setup_data(self, n_samples, noise=1.0):
+        data = sklearn.datasets.make_swiss_roll(n_samples=n_samples, noise=noise)[0]
+        data = data.astype("float64")[:, [0, 2]]
+        data /= 20  # Makes the data fit in the unit square
+        self.data = data
 
 def get_train_set(dataset_name, n_samples=100000, slack=None):
     with RNG(456):
