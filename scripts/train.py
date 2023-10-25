@@ -29,38 +29,56 @@ flags.mark_flags_as_required(["config"])
 #  fully connected network MLP in between
 
 class MLP_diffusion(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, input_dim, hidden_dim, output_dim, num_timesteps):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(2, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 2),
-        )
+        self.layer1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.layer2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.layer3 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.layer4 = torch.nn.Linear(hidden_dim, output_dim)
         self.double()
     
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, timestep):
+        y = self.layer1(x)
+        x = torch.nn.functional.silu(y)
+        y = self.layer2(x)
+        x = torch.nn.functional.silu(y)
+        y = self.layer3(x)
+        x = torch.nn.functional.silu(y)
+        y = self.layer4(x)
+        return y
     
-class MLP_diffusion2(torch.nn.Module):
-    def __init__(self) -> None:
+
+class PositionalEncodingNet(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_timesteps):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(2, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 256),
-            torch.nn.ReLU(),
-            torch.nn.Linear(256, 2),
-        )
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_timesteps = num_timesteps
+        
+        # Positional encoding initialization
+        self.position_enc = torch.nn.Parameter((position_encoding_init(num_timesteps, hidden_dim)), requires_grad=False)
+        
+        self.layer1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.layer2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.layer3 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.layer4 = torch.nn.Linear(hidden_dim, output_dim)
+        self.layer5 = torch.nn.Linear(output_dim, output_dim)
         self.double()
     
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, timestep):
+        # Positional encoding
+        pos_enc = self.position_enc[timestep].squeeze()
+        y = self.layer1(x)
+        x = torch.nn.functional.silu(y)
+        y = self.layer2(x + pos_enc)
+        x = torch.nn.functional.silu(x + y)
+        y = self.layer3(x  + pos_enc)
+        x = torch.nn.functional.silu(x + y)
+        y = self.layer4(x + pos_enc)
+        y = self.layer5(y)
+        return y
+    
 
 ## From https://github.com/ThiagoLira/ToyDiffusion/blob/main/diffusion.py
 def position_encoding_init(n_position, d_pos_vec):
@@ -85,6 +103,13 @@ def generate_normal_samples(N, input_dimension):
     samples = torch.distributions.multivariate_normal.MultivariateNormal(mean, cov).sample((N,))
     return samples.double()
 
+def generate_cosine_schedule(time_steps, s=0.008):
+    t = np.linspace(0, 1, time_steps)
+    f = np.square(np.cos(((t + s) / (1 + s)) * 0.5 * np.pi))
+    return np.clip(torch.from_numpy(f / f[0]), 0.000001, 0.999999)
+
+
+
 ## Training loop ##
 def train(config):
     if config.seed is not None:
@@ -105,36 +130,55 @@ def train(config):
     # beta is a linear function of the timestep 0 < beta_0 < beta_T < 1
     # is cumprod of 1-beta from 0 to T
     # T is total number of timesteps
-    t_total = 300
+    t_total = 1000
     betas = np.linspace(1e-4, 0.02, int(t_total))
     alphas = 1- torch.tensor(betas)
-    alpha_bar = torch.cumprod(alphas, 0)
+    alpha_bar = torch.cumprod(alphas, dim=0)
+
     
     pos_enc = position_encoding_init(t_total, 2).to('cuda')
 
     ## Load the model ##
-    model = MLP_diffusion2().to('cuda')
+    diffuser = MLP_diffusion(
+        input_dim=3,
+        hidden_dim=100,
+        output_dim=2,
+        num_timesteps=t_total
+    ).to('cuda')
 
     # randomize weights
-    for p in model.parameters():
+    for p in diffuser.parameters():
         torch.nn.init.normal_(p, 0, 0.05)
 
     ## Load the optimizer ##
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.optim.lr)
+    optimizer = torch.optim.Adam(diffuser.parameters(), lr=config.optim.lr)
     print("Starting training loop")
     ## Training loop ##
     x0 = next(inf_train_loader).numpy()
-    plt.scatter(x0[:, 0], x0[:, 1])
-    plt.show()
     # forward pass
-    timestep = (torch.randint(0, t_total-1, (x0.shape[0], 1))).to('cuda')
+    timestep = (torch.ones((x0.shape[0], 1)) * (t_total - 1)).to('cuda').int()
     x0 = torch.from_numpy(x0)
     x_t, epsilon = forward_pass(x0.to('cpu'), timestep.to('cpu'), alpha_bar)
     x_t = x_t.numpy()
-    plt.scatter(x_t[:, 0], x_t[:, 1])
+    # create 3 subplots
+    fig, axs = plt.subplots(1, 3)
+    # set fig size
+    fig.set_size_inches(18.5, 10.5)
+    # plot x0
+    axs[0].scatter(x_t[:, 0], x_t[:, 1])
+
+    timestep = (torch.ones((x0.shape[0], 1)) * (25)).to('cuda').int()
+    x_t, epsilon = forward_pass(x0.to('cpu'), timestep.to('cpu'), alpha_bar)
+    axs[1].scatter(x_t[:, 0], x_t[:, 1])
+
+    timestep = (torch.ones((x0.shape[0], 1)) * (1)).to('cuda').int()
+    x_t, epsilon = forward_pass(x0.to('cpu'), timestep.to('cpu'), alpha_bar)
+    axs[2].scatter(x_t[:, 0], x_t[:, 1])
     plt.show()
+    loss_list = []
     for iteration in range(config.training.n_iters):
         x0 = next(inf_train_loader).to('cuda')
+
         # forward pass
         # define timestep by random sampling from 1 - t_total
         timestep = (torch.randint(0, t_total-1, (x0.shape[0], 1))).to('cuda')
@@ -144,22 +188,26 @@ def train(config):
         x_t = x_t.to('cuda')
         #x_t = torch.cat([x_t.to('cuda'), (timestep / float(t_total)).to('cuda')], axis=1)
         # use positional encoding instead of timestep
-        x_t = x_t + pos_enc[timestep].squeeze()
-        eps_pred = model(x_t)
-        optimizer.zero_grad()
+        eps_pred = diffuser(torch.cat((x_t, timestep / 1000), axis=1), timestep)
         loss = torch.nn.functional.mse_loss(eps_pred, epsilon.to('cuda'), reduction='mean')
+        optimizer.zero_grad()
+        # iterate over batch and backprop
         loss.backward()
         optimizer.step()
-        if iteration % 500 == 0:
+        if iteration % 10 == 0:
             print(loss.item())
-        #wandb.log({"loss": loss.item()})
+            #wandb.log({"loss": loss.item()})
+        loss_list.append(loss.item())
     
     ## Plot the results ##
     # run inference pass on test set
-    model.eval().to('cuda')
+    # plot loss
+    plt.plot(loss_list)
+    plt.show()
+    diffuser = diffuser.eval()
     x0 = next(inf_val_loader).numpy()
-    x_val = inference_pass(x0, t_total, alphas, alpha_bar, pos_enc, model)
-
+    x_val = inference_pass(x0, t_total, alphas, alpha_bar, pos_enc, diffuser)
+    print(x_val)
     x_val = x_val.to('cpu').detach().numpy()
     plt.scatter(x_val[:, 0], x_val[:, 1])
     plt.show()
@@ -175,7 +223,7 @@ def forward_pass( x0, timesteps, alpha):
     noise = generate_normal_samples(x0.shape[0], x0.shape[1])
     a_t = alpha[timesteps]
     epsilon = torch.sqrt(1 - a_t) * noise
-    x_t = torch.sqrt(a_t) * x0 + epsilon
+    x_t = (torch.sqrt(a_t) * x0) + epsilon
     return x_t, noise
 
 ## Inference pass of the diffusion model
@@ -188,13 +236,14 @@ def inference_pass(x0, timesteps, alpha, alpha_bar, pos_enc, model):
         a_t = alpha[i]
         a_bar_t = alpha_bar[i]
         timestep_tensor = (torch.ones((x0.shape[0], 1)) * i).int().to('cuda')
-        eps = model(x_T + pos_enc[timestep_tensor].squeeze()).to('cuda')
+        model.zero_grad()
+        eps = model(torch.cat((x_T, timestep_tensor / 1000), axis=1), timestep_tensor).to('cuda')
         z_t = generate_normal_samples(x0.shape[0], x0.shape[1]).to('cuda')
         if i < 1:
             x_T = 1/np.sqrt(a_t) * (x_T - (((1 - a_t) / np.sqrt(1 - a_bar_t)) * eps))
         else:
-            x_T = 1/np.sqrt(a_t) * (x_T - (((1 - a_t) / np.sqrt(1 - a_bar_t)) * eps)) + np.sqrt(1 - a_t) * z_t
-        print(torch.max(x_T))
+            beta_bar = (1 - alpha_bar[i - 1]) / (1 - alpha_bar[i]) * (1 - alpha[i])
+            x_T = 1/np.sqrt(a_t) * (x_T - (((1 - a_t) / np.sqrt(1 - a_bar_t)) * eps)) + np.sqrt(beta_bar) * z_t
        
     return x_T
 
