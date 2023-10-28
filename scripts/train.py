@@ -39,15 +39,15 @@ class fully_connected(nn.Module):
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = torch.relu(self.fc3(x))
-        x = self.fc4(x)
+        x = torch.relu(self.fc2(x)) 
+        x = torch.relu(self.fc3(x)) 
+        x = (self.fc4(x))
         return x
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 ## Define nosie schedule ##
-t_total = 1000
+t_total = 2000
 beta = torch.linspace(1e-4, 0.02, t_total).to(device).unsqueeze(1)
 alpha = 1.0 - beta
 alpha_bar = torch.cumprod(alpha, dim=0)
@@ -74,12 +74,12 @@ def train(config):
     loss_fn = torch.nn.MSELoss().to(device)
 
     ## Learning Rate Scheduler
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
     x0 = next(inf_train_loader).to(device)
-    rand = torch.randn_like(x0).detach().cpu().numpy()
-
+    print(device)
     for iteration in range(config.training.n_iters):
         x0 = next(inf_train_loader).to(device)
+        x0 = normalize(x0)
         ## Create random timsteps
         timestep = (torch.randint(0, t_total-1, (x0.shape[0],)) ).to(device)
         x_t, eps = forward(x0, alpha_bar, timestep)
@@ -95,7 +95,7 @@ def train(config):
         ## Print loss
         if iteration % 100 == 0:
             print('Epoch: ', iteration, ' Loss: ',  loss.item(), end='\r')
-    
+    print('\n')
     ## Validation
     model.eval()
     x_pred, x_half, x_init = inference(x0, alpha_bar, alpha, t_total, model)
@@ -119,26 +119,32 @@ def forward(x0, alpha_bar, timestep):
 
 ## Inference Pass ##
 def inference(x0, alpha_bar, alpha, t_total, model):
-    x_T = torch.randn_like(x0)
-    x_T_half = None
-    x_T_start = x_T
-    for t in reversed(range(t_total)):
+    with torch.no_grad():
+        x_T = torch.randn_like(x0)
+        x_T_half = None
+        x_T_start = x_T
+        for t in reversed(range(t_total)):
+            model.zero_grad()
+            alpha_bar_t = alpha_bar[t]
+            alpha_t = alpha[t]
+            timestep = (torch.ones((x0.shape[0],)) * float(t) / t_total).to(device).unsqueeze(1).float()
+            epsilon = model(torch.cat((x_T, timestep), dim=1))
+            noise = torch.randn_like(x0).to(device)
+            print('Iteration: ', t, end='\r')
+            if t > 0:
+                beta_bar_t = (1.0 - alpha_bar[t-1]) / (1.0 - alpha_bar_t) * (1 - alpha_t)
+                x_T = (1.0 / torch.sqrt(alpha_t)) * (x_T - ((1 - alpha_t) / (1 - alpha_bar_t)) * epsilon) + torch.sqrt(beta_bar_t) * noise
+            else:
+                x_T = (1.0 / torch.sqrt(alpha_t)) * (x_T - ((1 - alpha_t) / (1 - alpha_bar_t)) * epsilon)
 
-        alpha_bar_t = alpha_bar[t]
-        alpha_t = alpha[t]
-        timestep = (torch.ones((x0.shape[0],)) * float(t) / t_total).to(device).unsqueeze(1).float()
-        epsilon = model(torch.cat((x_T, timestep), dim=1))
-        noise = torch.randn_like(x0).to(device)
-        print('Iteration: ', t, end='\r')
-        if t >= 1:
-            beta_bar_t = (1.0 - alpha_bar[t-1]) / (1.0 - alpha_bar_t) * (1 - alpha_t)
-            x_T = (1.0 / torch.sqrt(alpha_t)) * (x_T - ((1 - alpha_t) / (1 - alpha_bar_t)) * epsilon) + torch.sqrt(beta_bar_t) * noise
-        else:
-            x_T = (1.0 / torch.sqrt(alpha_t)) * (x_T - ((1 - alpha_t) / (1 - alpha_bar_t)) * epsilon)
+            if t == t_total // 2:
+                x_T_half = x_T
+        return x_T, x_T_half, x_T_start
 
-        if t == t_total // 2:
-            x_T_half = x_T
-    return x_T, x_T_half, x_T_start
+## Normalize Sample sets variance and mean ##
+def normalize(x):
+    x = (x - x.mean(dim=0)) / x.std(dim=0)
+    return x
 
 def main(argv):
     train(FLAGS.config)
